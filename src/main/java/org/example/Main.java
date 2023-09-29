@@ -10,9 +10,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
 import org.apache.http.client.methods.HttpGet;
 import org.apache.http.impl.client.CloseableHttpClient;
 import org.apache.http.impl.client.HttpClients;
@@ -122,11 +120,6 @@ public class Main {
                     System.out.printf("Skipping %s as it already exists \n", file.getName());
                     continue;
                 }
-                System.out.printf("File size: %d \n", file.length());
-                if (file.length() == 0) {
-                    System.out.printf("Skipping %s as it is empty \n", file.getName());
-                    continue;
-                }
 
                 String fileName = file.getName();
                 System.out.printf("Uploading %s \n", fileName);
@@ -227,10 +220,29 @@ public class Main {
             List<GHRelease> releases = repo.listReleases().asList();
             System.out.println("Number of releases: " + releases.size());
 
+            ExecutorService executorService = Executors.newFixedThreadPool(4);
+            CompletionService<Void> completionService =
+                    new ExecutorCompletionService<>(executorService);
+
             for (GHRelease release : releases) {
-                List<File> downloadedFiles = downloadReleaseAssets(release, preloadedFileNames);
-                uploadFiles(downloadedFiles, b2client, preloadedFileNames);
+                completionService.submit(
+                        () -> {
+                            List<File> downloadedFiles =
+                                    downloadReleaseAssets(release, preloadedFileNames);
+                            uploadFiles(downloadedFiles, b2client, preloadedFileNames);
+                            return null;
+                        });
             }
+
+            for (int i = 0; i < releases.size(); i++) {
+                try {
+                    completionService.take().get();
+                } catch (InterruptedException | ExecutionException e) {
+                    e.printStackTrace();
+                }
+            }
+
+            executorService.shutdown();
             System.out.println("Done");
             b2client.close();
 
