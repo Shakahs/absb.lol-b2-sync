@@ -1,8 +1,23 @@
 package org.example;
 
 import java.io.*;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+
+import com.backblaze.b2.client.B2StorageClient;
+import com.backblaze.b2.client.B2StorageClientFactory;
+import com.backblaze.b2.client.contentSources.B2ContentSource;
+import com.backblaze.b2.client.contentSources.B2FileContentSource;
+import com.backblaze.b2.client.exceptions.B2Exception;
+import com.backblaze.b2.client.structures.B2FileVersion;
+import com.backblaze.b2.client.structures.B2ListFileNamesRequest;
+import com.backblaze.b2.client.structures.B2ListUnfinishedLargeFilesRequest;
+import com.backblaze.b2.client.structures.B2UploadFileRequest;
 import org.apache.http.client.methods.HttpGet;
 import org.apache.http.impl.client.CloseableHttpClient;
 import org.apache.http.impl.client.HttpClients;
@@ -16,7 +31,7 @@ import org.kohsuke.github.GitHubBuilder;
 import static java.lang.StringTemplate.STR;
 
 public class Main {
-    public static List<File> downloadReleaseAssets(GHRelease release) throws IOException {
+    public static List<File> downloadReleaseAssets(GHRelease release,List<String> preloadedFileNames) throws IOException {
 
         List<File> downloadedFiles = new ArrayList<>();
         File tempDir = createTempDirectory();
@@ -28,6 +43,11 @@ public class Main {
             for (GHAsset asset : release.listAssets()) {
                 String assetName = asset.getName();
                 String downloadUrl = asset.getBrowserDownloadUrl();
+
+                if (preloadedFileNames.contains(assetName)) {
+                    System.out.println(STR."Skipping \{assetName} as it already exists");
+                    continue;
+                }
 
 
                 HttpGet request = new HttpGet(downloadUrl);
@@ -73,6 +93,7 @@ public class Main {
                 });
 
             }
+            httpClient.close();
 
         } catch (Exception e) {
             e.printStackTrace();
@@ -89,8 +110,83 @@ public class Main {
         return tempDir;
     }
 
+    public static void uploadFiles(List<File> filesToUpload, B2StorageClient b2client,List<String> preloadedFileNames  ) {
+        try   {
+
+            for (File file : filesToUpload) {
+                if (preloadedFileNames.contains(file.getName())) {
+                    System.out.println(STR."Skipping \{file.getName()} as it already exists");
+                    continue;
+                }
+                String fileName = file.getName();
+                System.out.println(STR."Uploading \{fileName}");
+
+                String contentType = "application/x-tar";
+               try {
+                   contentType= Files.probeContentType(Path.of(file.getAbsolutePath()));
+               } catch (IOException e) {
+                   e.printStackTrace();}
+
+                B2UploadFileRequest request = B2UploadFileRequest
+                        .builder("57f71749bef6b9b38b990c12", fileName, contentType ,   B2FileContentSource.builder(file).build())
+                        .build();
+
+                ExecutorService executorService = Executors.newFixedThreadPool(2);
+                b2client.uploadLargeFile(request , executorService );
+                executorService.shutdown();
+                try {
+                    if (!executorService.awaitTermination(5, TimeUnit.SECONDS)) {
+                        System.out.println("executorService timed out during upload");
+                        executorService.shutdownNow(); // Force shutdown
+                    }
+                } catch (InterruptedException e) {
+                    System.out.println("executorService was interrupted");
+                    executorService.shutdownNow(); // Preserve the interrupt status
+                    Thread.currentThread().interrupt();
+                }
+
+                System.out.println(STR."Uploaded \{fileName}");
+            }
+
+        } catch (B2Exception e) {
+            // Exception handling here
+            e.printStackTrace();
+        }
+    }
+
     public static void main(String[] args) {
         System.out.println("Checking ADSB.lol Github releases");
+        B2StorageClient b2client = B2StorageClientFactory
+                .createDefaultFactory()
+                .create("0057779e693b9c20000000001", "K0056wTbaRoWE4Ki2m2USgicRBeK9Ps", "AdsbLolMirror");
+
+        try {
+            B2ListUnfinishedLargeFilesRequest request = B2ListUnfinishedLargeFilesRequest.builder("57f71749bef6b9b38b990c12").build();
+
+            // Fetch and iterate through the unfinished large files.
+            for (B2FileVersion file : b2client.unfinishedLargeFiles(request)) {
+                // Delete each unfinished large file.
+                b2client.cancelLargeFile(file.getFileId());
+                System.out.println("Deleted unfinished large file with ID: " + file.getFileId());
+            }
+        } catch (B2Exception e) {
+            System.out.println("Error deleting unfinished large files");
+            e.printStackTrace();
+        }
+
+        // Preload filenames
+        List<String> preloadedFileNames = new ArrayList<>();
+        B2ListFileNamesRequest     b2ListRequest =    B2ListFileNamesRequest.builder("57f71749bef6b9b38b990c12").setMaxFileCount(10000).build();
+        try {
+            Iterable<B2FileVersion> fileVersions = b2client.fileNames(b2ListRequest);
+            for (B2FileVersion fileVersion : fileVersions) {
+                preloadedFileNames.add(fileVersion.getFileName());
+                System.out.println("Preloaded filename: " + fileVersion.getFileName());
+            }
+        } catch (B2Exception e) {
+            System.out.println("Error preloading filenames");
+            e.printStackTrace();
+        }
 
         try {
             // Initialize GitHub object with your personal access token
@@ -105,22 +201,20 @@ public class Main {
             GHRepository repo = github.getRepository("adsblol/globe_history");
 
             // Get the list of releases
-            List<GHRelease> releases = repo.listReleases().asList();
+            List<GHRelease> releases = repo.listReleases().asList().reversed();
             System.out.println("Number of releases: " + releases.size());
-            GHRelease firstRelease = releases.getLast();
+//            GHRelease firstRelease = releases.getLast();
 //            GHRelease firstRelease = repo.getLatestRelease();
+            List<GHRelease> newArray = new ArrayList<GHRelease>( );
+            newArray.add(releases.getFirst());
 
-            List<File> downloadedFiles = downloadReleaseAssets(firstRelease);
-            System.out.println("Downloaded " + downloadedFiles.size() + " files");
+            for (GHRelease release : releases) {
+                List<File> downloadedFiles = downloadReleaseAssets(release,preloadedFileNames);
+                uploadFiles(downloadedFiles, b2client, preloadedFileNames);
+            }
+            System.out.println("Done");
+            b2client.close();
 
-            // Print out details of each release
-//            for (GHRelease release : releases) {
-//                System.out.println("ID: " + release.getId());
-//                System.out.println("Tag: " + release.getTagName());
-//                System.out.println("Name: " + release.getName());
-//                System.out.println("Published at: " + release.getPublished_at());
-//                System.out.println("----------------------");
-//            }
 
         } catch (IOException e) {
             e.printStackTrace();
